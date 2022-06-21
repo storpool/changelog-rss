@@ -1,13 +1,32 @@
 import os
+import re
 import sys
 import urllib.parse
+import logging
+
+from functools import reduce
 
 from flask import Flask, abort, redirect, url_for
 from pygerrit2 import GerritRestAPI, HTTPBasicAuth
 from feedgen.feed import FeedGenerator
 
-app = Flask(__name__)
 fg = FeedGenerator()
+app = Flask(__name__)
+app.logger.setLevel(logging.DEBUG)
+
+change_id_blacklist = ["Iceab8ffe2b0e6e0ea074ca7da0743562d8d30f04"]
+revision_pattern = re.compile(r"[0-9]{2}\.[0-9]{2}\.[0-9]{1,5}\.[0-9a-f]{9}")
+public_change_pattern = re.compile(r"- .*")
+private_change_pattern = re.compile(r"\.\. ([0-9]{2}\.[0-9]{2}\.[0-9]{1,5}\.)?[0-9a-f]{9}.*")
+
+
+def reduce_diff_lines(lines: list, diff_line: dict) -> list:
+    if isinstance(diff_line["b"], str) and len(diff_line["b"]):
+        lines.extend(diff_line["b"])
+    elif isinstance(diff_line["b"], list) and len(diff_line["b"]):
+        lines.extend(filter(lambda line: len(line), diff_line["b"]))
+
+    return lines
 
 
 def cleanup_markdown(change: str) -> str:
@@ -16,46 +35,56 @@ def cleanup_markdown(change: str) -> str:
 
 def create_changelog_object(gerrit_client: GerritRestAPI, gerrit_change: dict) -> dict:
     revision_id = list(gerrit_change["revisions"].keys())[0]
-    file_name = list(gerrit_change["revisions"][revision_id]["files"].keys())[0]
-    diff = gerrit_client.get("/changes/" + gerrit_change["id"] + "/revisions/" + revision_id + "/files/" + urllib.parse.quote_plus(file_name) + "/diff")
-    change_lines = list(filter(lambda line: len(line), diff["content"][1]["b"]))
+    file_path = list(gerrit_change["revisions"][revision_id]["files"].keys())[0]
+    diff = gerrit_client.get("/changes/" + gerrit_change["id"] + "/revisions/" + revision_id + "/files/" + urllib.parse.quote_plus(file_path) + "/diff?whitespace=IGNORE_LEADING_AND_TRAILING")
+    change_lines = reduce(reduce_diff_lines, filter(lambda line: "b" in line, diff["content"]), [])
 
     changelog = {
-        "revision": change_lines[1].split(" ")[2],
-        "release_date": change_lines[3],
+        "revision": "",
+        "release_date": change_lines[2],
         "public_changes": [],
         "private_changes": []
     }
 
-    private_changes_delimiter_line_index = [change_lines.index(line) for line in change_lines if ".. revision" in line][0]
-    public_lines_slice = change_lines[4:private_changes_delimiter_line_index]
-    private_lines_slice = change_lines[private_changes_delimiter_line_index+1:]
+    for line in change_lines:
+        revision_match = revision_pattern.search(change_lines[0])
 
-    for line in public_lines_slice:
-        changelog["public_changes"].append(cleanup_markdown(line))
+        if revision_match is not None:
+            changelog["revision"] = revision_match.string
+
+        public_change_match = public_change_pattern.search(line)
+
+        if public_change_match is not None:
+            changelog["public_changes"].append(public_change_match.string)
+
+        private_change_match = private_change_pattern.search(line)
+
+        if private_change_match is not None:
+            changelog["private_changes"].append(private_change_match.string)
 
     return changelog
 
 
 def build_feed():
     try:
-        gerrit_auth = HTTPBasicAuth(os.environ.get('GERRIT_USERNAME'), os.environ.get('GERRIT_USERNAME'))
+        gerrit_auth = HTTPBasicAuth(os.environ.get('GERRIT_USERNAME'), os.environ.get('GERRIT_PASSWORD'))
         gerrit_client = GerritRestAPI(os.environ.get('GERRIT_URL'), auth=gerrit_auth, verify=False)
     except KeyError as e:
+        app.logger.exception(e)
         sys.exit(1)
 
-    changes = gerrit_client.get("changes/?q=changelog-19:+and+status:merged&o=CURRENT_REVISION&o=CURRENT_FILES")
-    for change in changes:
+    changes = gerrit_client.get("changes/?q=changelog-19+up&o=CURRENT_REVISION&o=CURRENT_FILES")
+    for change in filter(lambda element: element["change_id"] not in change_id_blacklist, changes):
         changelog = create_changelog_object(gerrit_client, change)
         feed_entry = fg.add_entry()
 
 
 @app.route('/rebuild', methods=['POST'])
 def rebuild_feed():
-    build_feed()
     try:
         build_feed()
-    except Exception:
+    except Exception as e:
+        app.logger.exception(e)
         abort(500)
     finally:
         return "", 201
