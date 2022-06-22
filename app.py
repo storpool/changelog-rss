@@ -36,21 +36,35 @@ def cleanup_markdown(change: str) -> str:
 def create_changelog_object(gerrit_client: GerritRestAPI, gerrit_change: dict) -> dict:
     revision_id = list(gerrit_change["revisions"].keys())[0]
     file_path = list(gerrit_change["revisions"][revision_id]["files"].keys())[0]
-    diff = gerrit_client.get("/changes/" + gerrit_change["id"] + "/revisions/" + revision_id + "/files/" + urllib.parse.quote_plus(file_path) + "/diff?whitespace=IGNORE_LEADING_AND_TRAILING")
-    change_lines = reduce(reduce_diff_lines, filter(lambda line: "b" in line, diff["content"]), [])
+    diff = gerrit_client.get(
+        "/changes/" + gerrit_change["id"] + "/revisions/" + revision_id + "/files/" + urllib.parse.quote_plus(
+            file_path) + "/diff?whitespace=IGNORE_LEADING_AND_TRAILING")
+    change_lines_all = reduce(reduce_diff_lines, filter(lambda line: "b" in line, diff["content"]), [])
 
     changelog = {
-        "revision": "",
-        "release_date": change_lines[2],
+        "revision": None,
+        "release_date": gerrit_change["updated"],
         "public_changes": [],
         "private_changes": []
     }
 
-    for line in change_lines:
-        revision_match = revision_pattern.search(change_lines[0])
+    try:
+        change_lines_start_index = \
+            [change_lines_all.index(line) for line in change_lines_all if ".. _changelog_" in line][0]
 
+        if len(change_lines_all[change_lines_start_index:]) > 3:
+            change_lines = change_lines_all[change_lines_start_index:]
+        else:
+            change_lines = change_lines_all
+    except IndexError:
+        app.logger.warning(f"Could not find the _changelog delimiter for change {gerrit_change['_number']}, starting "
+                           f"from the begging of the diff")
+        change_lines = change_lines_all
+
+    for line in change_lines:
+        revision_match = revision_pattern.search(line)
         if revision_match is not None:
-            changelog["revision"] = revision_match.string
+            changelog["revision"] = revision_match[0]
 
         public_change_match = public_change_pattern.search(line)
 
@@ -61,6 +75,14 @@ def create_changelog_object(gerrit_client: GerritRestAPI, gerrit_change: dict) -
 
         if private_change_match is not None:
             changelog["private_changes"].append(private_change_match.string)
+
+    if changelog["revision"] is None:
+        try:
+            if len(changelog["private_changes"]):
+                changelog["revision"] = revision_pattern.search(changelog["private_changes"][0])[0]
+        except Exception as e:
+            app.logger.exception(e)
+            return None
 
     return changelog
 
@@ -77,6 +99,7 @@ def build_feed():
     for change in filter(lambda element: element["change_id"] not in change_id_blacklist, changes):
         changelog = create_changelog_object(gerrit_client, change)
         feed_entry = fg.add_entry()
+        feed_entry.author({"name": "StorPool QA Team", "email": "support@storpool.com"})
 
 
 @app.route('/rebuild', methods=['POST'])
